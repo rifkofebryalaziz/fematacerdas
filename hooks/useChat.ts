@@ -5,21 +5,38 @@ import { createClient } from '@/lib/supabase';
 import { Chat, Message } from '@/types';
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000';
+const LAST_CHAT_KEY = 'last_active_chat';
+// ✅ Key untuk track session — bedakan "login baru" vs "restore tab"
+const SESSION_KEY = 'chat_session_id';
+
+function isAbortError(err: unknown): boolean {
+  if (err instanceof Error && err.name === 'AbortError') return true;
+  const msg = err instanceof Error ? err.message : JSON.stringify(err);
+  return msg.includes('AbortError') || msg.includes('Lock broken');
+}
 
 export function useChat(isAuthenticated: boolean) {
   const [chats, setChats] = useState<Chat[]>([]);
-  const [activeChat, setActiveChat] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoadingChats, setIsLoadingChats] = useState(false);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
+  const [activeChat, setActiveChat] = useState<string | null>(null);
 
   const activeChatRef = useRef<string | null>(null);
   const isFetchingChats = useRef(false);
+  const currentUserIdRef = useRef<string | null>(null);
+  const visibilityDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const supabaseRef = useRef(createClient());
   const supabase = supabaseRef.current;
 
   useEffect(() => {
     activeChatRef.current = activeChat;
+  }, [activeChat]);
+
+  useEffect(() => {
+    if (activeChat) {
+      localStorage.setItem(LAST_CHAT_KEY, activeChat);
+    }
   }, [activeChat]);
 
   const loadMessages = useCallback(async (chatId: string) => {
@@ -34,33 +51,54 @@ export function useChat(isAuthenticated: boolean) {
 
       if (error) throw error;
 
-      if (activeChatRef.current === chatId) {
-        setMessages(
-          (data || []).map((m) => ({
-            id: m.id,
-            role: m.role,
-            content: m.content,
-            sources: m.sources || [],
-          }))
-        );
+      setMessages(
+        (data || []).map((m) => ({
+          id: m.id,
+          role: m.role,
+          content: m.content,
+          sources: m.sources || [],
+        }))
+      );
+    } catch (err: unknown) {
+      if (isAbortError(err)) {
+        console.warn('loadMessages: AbortError diabaikan');
+        return;
       }
-    } catch (err) {
-      console.error('Error loading messages:', err);
+      const msg = err instanceof Error ? err.message : JSON.stringify(err);
+      console.error('Error loading messages:', msg);
     } finally {
-      if (activeChatRef.current === chatId) {
-        setIsLoadingMessages(false);
-      }
+      setIsLoadingMessages(false);
     }
   }, [supabase]);
 
-  const loadChats = useCallback(async () => {
+  const loadChats = useCallback(async (isTabRestore = false) => {
     if (isFetchingChats.current) return;
     isFetchingChats.current = true;
     setIsLoadingChats(true);
     try {
+      const { data: { user }, error: userError } = await supabase.auth.getUser();
+      if (userError || !user) {
+        console.warn('Auth error saat loadChats:', userError?.message);
+        return;
+      }
+
+      // ✅ Deteksi apakah ini sesi baru (login) atau restore tab
+      // Caranya: bandingkan user_id yang tersimpan di sessionStorage
+      // sessionStorage hilang saat tab/browser ditutup, tapi TETAP ada saat pindah tab
+      const savedSessionUserId = sessionStorage.getItem(SESSION_KEY);
+      const isNewLogin = savedSessionUserId !== user.id;
+
+      if (isNewLogin) {
+        // Login baru → simpan session, jangan restore localStorage
+        sessionStorage.setItem(SESSION_KEY, user.id);
+      }
+
+      currentUserIdRef.current = user.id;
+
       const { data, error } = await supabase
         .from('chats')
         .select('*')
+        .eq('user_id', user.id)
         .order('updated_at', { ascending: false });
 
       if (error) throw error;
@@ -75,62 +113,103 @@ export function useChat(isAuthenticated: boolean) {
 
       if (mapped.length > 0) {
         setActiveChat((prev) => {
-          const stillExists = mapped.find((c) => c.id === prev);
-          return stillExists ? prev : mapped[0].id;
+          if (isNewLogin) {
+            // ✅ Login baru → jangan restore, biarkan null (tampilkan welcome screen)
+            // Hanya set ke mapped[0] jika prev sudah ada (artinya bukan pertama kali render)
+            return null;
+          }
+
+          // ✅ Restore tab / reload — pertahankan chat yang aktif
+          const savedId = localStorage.getItem(LAST_CHAT_KEY);
+          const targetId = prev || savedId;
+          const exists = mapped.find((c) => c.id === targetId);
+          return exists ? targetId : (prev || null);
         });
       } else {
-        const { data: { user } } = await supabase.auth.getUser();
-        if (user) {
-          const { data: newChat } = await supabase
-            .from('chats')
-            .insert({ user_id: user.id, title: 'Chat Baru' })
-            .select()
-            .single();
-          if (newChat) {
-            setChats([{ id: newChat.id, title: newChat.title, starred: newChat.starred }]);
+        // Tidak ada chat → buat otomatis
+        const { data: newChat } = await supabase
+          .from('chats')
+          .insert({ user_id: user.id, title: 'Chat Baru' })
+          .select()
+          .single();
+        if (newChat) {
+          setChats([{ id: newChat.id, title: newChat.title, starred: newChat.starred }]);
+          // Hanya auto-select jika bukan login baru
+          if (!isNewLogin) {
             setActiveChat(newChat.id);
           }
         }
       }
-    } catch (err) {
-      console.error('Error loading chats:', err);
+    } catch (err: unknown) {
+      if (isAbortError(err)) {
+        console.warn('loadChats: AbortError diabaikan');
+        return;
+      }
+      const msg = err instanceof Error ? err.message : JSON.stringify(err);
+      console.error('Error loading chats:', msg);
     } finally {
       setIsLoadingChats(false);
       isFetchingChats.current = false;
     }
   }, [supabase]);
 
-  // ✅ Hanya jalan saat isAuthenticated = true
   useEffect(() => {
     if (!isAuthenticated) {
-      // Reset semua state saat logout
       setChats([]);
       setActiveChat(null);
       setMessages([]);
       setIsLoadingChats(false);
+      currentUserIdRef.current = null;
+      localStorage.removeItem(LAST_CHAT_KEY);
+      // ✅ Hapus session saat logout agar login berikutnya terdeteksi sebagai "baru"
+      sessionStorage.removeItem(SESSION_KEY);
       return;
     }
 
-    // Load pertama kali setelah login
     loadChats();
 
-    // ✅ Reload saat tab aktif kembali
-    const handleVisibility = async () => {
+    const handleVisibility = () => {
       if (document.visibilityState !== 'visible') return;
-      const currentChatId = activeChatRef.current;
-      await Promise.all([
-        loadChats(),
-        currentChatId ? loadMessages(currentChatId) : Promise.resolve(),
-      ]);
+
+      if (visibilityDebounceRef.current) {
+        clearTimeout(visibilityDebounceRef.current);
+      }
+
+      visibilityDebounceRef.current = setTimeout(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+
+        const { data: { user }, error: userError } = await supabase.auth.getUser();
+        if (userError || !user) {
+          console.warn('Session tidak valid saat visibility change, skip reload.');
+          return;
+        }
+
+        let currentChatId = activeChatRef.current;
+        if (!currentChatId) {
+          const savedId = localStorage.getItem(LAST_CHAT_KEY);
+          if (savedId) {
+            currentChatId = savedId;
+            setActiveChat(savedId);
+          }
+        }
+
+        // ✅ isTabRestore = true → jangan reset ke welcome screen
+        await loadChats(true);
+        if (currentChatId) {
+          await loadMessages(currentChatId);
+        }
+      }, 500);
     };
 
     document.addEventListener('visibilitychange', handleVisibility);
     return () => {
       document.removeEventListener('visibilitychange', handleVisibility);
+      if (visibilityDebounceRef.current) {
+        clearTimeout(visibilityDebounceRef.current);
+      }
     };
-  }, [isAuthenticated, loadChats, loadMessages]);
+  }, [isAuthenticated, loadChats, loadMessages, supabase]);
 
-  // Load messages saat activeChat berubah
   useEffect(() => {
     if (activeChat) {
       loadMessages(activeChat);
@@ -159,7 +238,10 @@ export function useChat(isAuthenticated: boolean) {
   };
 
   const selectChat = (id: string) => {
-    if (id === activeChat) return;
+    if (id === activeChat) {
+      loadMessages(id);
+      return;
+    }
     setActiveChat(id);
   };
 
@@ -171,7 +253,13 @@ export function useChat(isAuthenticated: boolean) {
       setChats(remaining);
       if (activeChat === id) {
         setMessages([]);
-        setActiveChat(remaining[0]?.id || null);
+        const nextId = remaining[0]?.id || null;
+        setActiveChat(nextId);
+        if (nextId) {
+          localStorage.setItem(LAST_CHAT_KEY, nextId);
+        } else {
+          localStorage.removeItem(LAST_CHAT_KEY);
+        }
       }
     } catch (err) {
       console.error('Error deleting chat:', err);

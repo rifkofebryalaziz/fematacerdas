@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useCallback } from 'react';
 import { LoginForm } from '@/components/auth/LoginForm';
 import { RegisterForm } from '@/components/auth/RegisterForm';
 import { ForgotPasswordForm } from '@/components/auth/ForgotPasswordForm';
@@ -14,6 +14,7 @@ import { SettingsModal } from '@/components/modals/SettingsModal';
 import { useAuthContext } from '@/context/AuthContext';
 import { useChatContext } from '@/context/ChatContext';
 import { Settings } from '@/types';
+
 
 type AuthPage = 'login' | 'register' | 'forgot-password';
 
@@ -41,15 +42,15 @@ export default function Home() {
   const { user, isAuthenticated, login, register, loginWithGoogle, forgotPassword, logout, updateProfile } = useAuthContext();
   const { chats, activeChat, messages, createNewChat, selectChat, deleteChat, toggleStarChat, sendMessage, getCurrentChatTitle } = useChatContext();
 
-  const handleSelectChat = (id: string) => {
+  const handleSelectChat = useCallback((id: string) => {
     setShowRecommendations(false);
     selectChat(id);
-  };
+  }, [selectChat]);
 
-  const handleNewChat = () => {
+  const handleNewChat = useCallback(() => {
     setShowRecommendations(false);
     createNewChat();
-  };
+  }, [createNewChat]);
 
   if (!isAuthenticated) {
     if (authPage === 'forgot-password') {
