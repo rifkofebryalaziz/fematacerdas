@@ -6,8 +6,10 @@ import { Chat, Message } from '@/types';
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000';
 const LAST_CHAT_KEY = 'last_active_chat';
-// ✅ Key untuk track session — bedakan "login baru" vs "restore tab"
-const SESSION_KEY = 'chat_session_id';
+
+// ✅ FIX Bug 4: Pakai in-memory flag, bukan sessionStorage yang bisa hilang saat tab suspend
+// Flag ini hidup selama aplikasi berjalan di tab yang sama
+let hasInitializedForUser: string | null = null;
 
 function isAbortError(err: unknown): boolean {
   if (err instanceof Error && err.name === 'AbortError') return true;
@@ -24,7 +26,6 @@ export function useChat(isAuthenticated: boolean) {
 
   const activeChatRef = useRef<string | null>(null);
   const isFetchingChats = useRef(false);
-  const currentUserIdRef = useRef<string | null>(null);
   const visibilityDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const supabaseRef = useRef(createClient());
   const supabase = supabaseRef.current;
@@ -64,8 +65,7 @@ export function useChat(isAuthenticated: boolean) {
         console.warn('loadMessages: AbortError diabaikan');
         return;
       }
-      const msg = err instanceof Error ? err.message : JSON.stringify(err);
-      console.error('Error loading messages:', msg);
+      console.error('Error loading messages:', err instanceof Error ? err.message : err);
     } finally {
       setIsLoadingMessages(false);
     }
@@ -75,6 +75,7 @@ export function useChat(isAuthenticated: boolean) {
     if (isFetchingChats.current) return;
     isFetchingChats.current = true;
     setIsLoadingChats(true);
+
     try {
       const { data: { user }, error: userError } = await supabase.auth.getUser();
       if (userError || !user) {
@@ -82,18 +83,12 @@ export function useChat(isAuthenticated: boolean) {
         return;
       }
 
-      // ✅ Deteksi apakah ini sesi baru (login) atau restore tab
-      // Caranya: bandingkan user_id yang tersimpan di sessionStorage
-      // sessionStorage hilang saat tab/browser ditutup, tapi TETAP ada saat pindah tab
-      const savedSessionUserId = sessionStorage.getItem(SESSION_KEY);
-      const isNewLogin = savedSessionUserId !== user.id;
-
-      if (isNewLogin) {
-        // Login baru → simpan session, jangan restore localStorage
-        sessionStorage.setItem(SESSION_KEY, user.id);
+      // ✅ FIX Bug 4: Gunakan module-level variable (in-memory, tidak hilang saat tab suspend)
+      // isNewLogin = true hanya pertama kali user ini login di tab ini
+      const isNewLogin = hasInitializedForUser !== user.id;
+      if (isNewLogin && !isTabRestore) {
+        hasInitializedForUser = user.id;
       }
-
-      currentUserIdRef.current = user.id;
 
       const { data, error } = await supabase
         .from('chats')
@@ -113,29 +108,36 @@ export function useChat(isAuthenticated: boolean) {
 
       if (mapped.length > 0) {
         setActiveChat((prev) => {
+          // isTabRestore: selalu pertahankan chat yang aktif
+          if (isTabRestore) {
+            const savedId = localStorage.getItem(LAST_CHAT_KEY);
+            const targetId = prev || savedId;
+            const exists = mapped.find((c) => c.id === targetId);
+            return exists ? targetId : mapped[0].id;
+          }
+
+          // Login baru → jangan auto-select, tampilkan welcome screen
           if (isNewLogin) {
-            // ✅ Login baru → jangan restore, biarkan null (tampilkan welcome screen)
-            // Hanya set ke mapped[0] jika prev sudah ada (artinya bukan pertama kali render)
             return null;
           }
 
-          // ✅ Restore tab / reload — pertahankan chat yang aktif
+          // Reload biasa → pertahankan chat sebelumnya
           const savedId = localStorage.getItem(LAST_CHAT_KEY);
           const targetId = prev || savedId;
           const exists = mapped.find((c) => c.id === targetId);
           return exists ? targetId : (prev || null);
         });
       } else {
-        // Tidak ada chat → buat otomatis
-        const { data: newChat } = await supabase
-          .from('chats')
-          .insert({ user_id: user.id, title: 'Chat Baru' })
-          .select()
-          .single();
-        if (newChat) {
-          setChats([{ id: newChat.id, title: newChat.title, starred: newChat.starred }]);
-          // Hanya auto-select jika bukan login baru
-          if (!isNewLogin) {
+        // Tidak ada chat → buat otomatis hanya saat bukan login baru
+        if (!isNewLogin || isTabRestore) {
+          const { data: newChat } = await supabase
+            .from('chats')
+            .insert({ user_id: user.id, title: 'Chat Baru' })
+            .select()
+            .single();
+          if (newChat) {
+            const nc = { id: newChat.id, title: newChat.title, starred: newChat.starred };
+            setChats([nc]);
             setActiveChat(newChat.id);
           }
         }
@@ -145,8 +147,7 @@ export function useChat(isAuthenticated: boolean) {
         console.warn('loadChats: AbortError diabaikan');
         return;
       }
-      const msg = err instanceof Error ? err.message : JSON.stringify(err);
-      console.error('Error loading chats:', msg);
+      console.error('Error loading chats:', err instanceof Error ? err.message : err);
     } finally {
       setIsLoadingChats(false);
       isFetchingChats.current = false;
@@ -159,14 +160,13 @@ export function useChat(isAuthenticated: boolean) {
       setActiveChat(null);
       setMessages([]);
       setIsLoadingChats(false);
-      currentUserIdRef.current = null;
       localStorage.removeItem(LAST_CHAT_KEY);
-      // ✅ Hapus session saat logout agar login berikutnya terdeteksi sebagai "baru"
-      sessionStorage.removeItem(SESSION_KEY);
+      // ✅ Reset in-memory flag saat logout agar login berikutnya terdeteksi sebagai baru
+      hasInitializedForUser = null;
       return;
     }
 
-    loadChats();
+    loadChats(false);
 
     const handleVisibility = () => {
       if (document.visibilityState !== 'visible') return;
@@ -193,7 +193,7 @@ export function useChat(isAuthenticated: boolean) {
           }
         }
 
-        // ✅ isTabRestore = true → jangan reset ke welcome screen
+        // isTabRestore = true → pertahankan chat aktif, jangan reset ke welcome screen
         await loadChats(true);
         if (currentChatId) {
           await loadMessages(currentChatId);

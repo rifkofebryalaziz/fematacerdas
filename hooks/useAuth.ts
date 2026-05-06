@@ -1,10 +1,10 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase';
 import { User } from '@/types';
 
-// ✅ Helper: deteksi AbortError/Lock conflict — bukan error fatal
 function isAbortError(err: unknown): boolean {
   if (err instanceof Error && err.name === 'AbortError') return true;
   const msg = err instanceof Error ? err.message : JSON.stringify(err);
@@ -18,23 +18,27 @@ export function useAuth() {
 
   const supabaseRef = useRef(createClient());
   const supabase = supabaseRef.current;
-
-  // ✅ Guard agar loadProfile tidak jalan bersamaan (concurrent)
   const isLoadingProfileRef = useRef(false);
 
-  const clearSession = () => {
+  // ✅ FIX Bug 2: Simpan isAuthenticated di ref agar closure selalu baca nilai terbaru
+  const isAuthenticatedRef = useRef(false);
+  useEffect(() => {
+    isAuthenticatedRef.current = isAuthenticated;
+  }, [isAuthenticated]);
+
+  const router = useRouter();
+
+  const clearSession = useCallback(() => {
     setUser(null);
     setIsAuthenticated(false);
+    isAuthenticatedRef.current = false;
     Object.keys(localStorage).forEach((key) => {
-      if (key.startsWith('sb-')) {
-        localStorage.removeItem(key);
-      }
+      if (key.startsWith('sb-')) localStorage.removeItem(key);
     });
     localStorage.removeItem('last_active_chat');
-  };
+  }, []);
 
-  const loadProfile = async (userId: string) => {
-    // ✅ Jika sedang loading profile, skip — hindari concurrent call
+  const loadProfile = useCallback(async (userId: string) => {
     if (isLoadingProfileRef.current) {
       console.warn('loadProfile: sudah berjalan, skip duplikat call');
       return;
@@ -49,13 +53,11 @@ export function useAuth() {
         .maybeSingle();
 
       if (error) {
-        // ✅ Abaikan AbortError — bukan error fatal
         if (isAbortError(error)) {
-          console.warn('loadProfile: AbortError diabaikan (lock conflict)');
+          console.warn('loadProfile: AbortError diabaikan');
           return;
         }
-        const msg = error instanceof Error ? error.message : JSON.stringify(error);
-        console.error('Load profile error:', msg);
+        console.error('Load profile error:', error.message);
         return;
       }
 
@@ -70,19 +72,20 @@ export function useAuth() {
           role: profile.role,
         });
         setIsAuthenticated(true);
+        isAuthenticatedRef.current = true;
       }
     } catch (err: unknown) {
-      // ✅ Abaikan AbortError di level exception juga
       if (isAbortError(err)) {
-        console.warn('loadProfile: AbortError diabaikan (lock conflict)');
+        console.warn('loadProfile: AbortError diabaikan');
         return;
       }
-      const msg = err instanceof Error ? err.message : JSON.stringify(err);
-      console.error('loadProfile exception:', msg);
+      console.error('loadProfile exception:', err instanceof Error ? err.message : err);
     } finally {
       isLoadingProfileRef.current = false;
+      // ✅ FIX Bug 1: Pastikan isLoading selalu di-set false setelah loadProfile selesai
+      setIsLoading(false);
     }
-  };
+  }, [supabase]);
 
   useEffect(() => {
     const initSession = async () => {
@@ -98,6 +101,7 @@ export function useAuth() {
 
         if (session?.user) {
           await loadProfile(session.user.id);
+          // loadProfile sudah set setIsLoading(false) di finally-nya
         } else {
           setIsLoading(false);
         }
@@ -133,9 +137,8 @@ export function useAuth() {
           await loadProfile(session.user.id);
         } else {
           clearSession();
+          setIsLoading(false);
         }
-
-        setIsLoading(false);
       }
     );
 
@@ -152,7 +155,8 @@ export function useAuth() {
           clearSession();
           return;
         }
-        if (!session && isAuthenticated) {
+        // ✅ FIX Bug 2: Gunakan ref, bukan closure variable
+        if (!session && isAuthenticatedRef.current) {
           clearSession();
         }
       } catch (err) {
@@ -171,8 +175,7 @@ export function useAuth() {
       subscription.unsubscribe();
       document.removeEventListener('visibilitychange', handleVisibility);
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [supabase, loadProfile, clearSession]);
 
   const login = async (email: string, password: string) => {
     const { error } = await supabase.auth.signInWithPassword({ email, password });
@@ -193,9 +196,7 @@ export function useAuth() {
       provider: 'google',
       options: {
         redirectTo: `${window.location.origin}/auth/callback`,
-        queryParams: {
-          prompt: 'select_account',
-        },
+        queryParams: { prompt: 'select_account' },
       },
     });
     if (error) throw new Error(error.message);
@@ -208,8 +209,18 @@ export function useAuth() {
     if (error) throw new Error(error.message);
   };
 
+  // ✅ FIX Bug 3: logout sekarang clear state + redirect
   const logout = async () => {
-    await supabase.auth.signOut();
+    try {
+      await supabase.auth.signOut();
+    } catch (err) {
+      console.warn('signOut error:', err);
+    } finally {
+      // Pastikan state bersih meski signOut gagal
+      clearSession();
+      sessionStorage.removeItem('chat_session_id');
+      router.push('/login');
+    }
   };
 
   const updateProfile = async (updates: Partial<User>) => {
