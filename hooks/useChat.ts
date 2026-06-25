@@ -7,25 +7,29 @@ import { Chat, Message } from '@/types';
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000';
 const LAST_CHAT_KEY = 'last_active_chat';
 
-// ✅ FIX Bug 4: Pakai in-memory flag, bukan sessionStorage yang bisa hilang saat tab suspend
-// Flag ini hidup selama aplikasi berjalan di tab yang sama
+// In-memory flag — tidak hilang saat tab suspend (berbeda dengan sessionStorage)
 let hasInitializedForUser: string | null = null;
 
 function isAbortError(err: unknown): boolean {
   if (err instanceof Error && err.name === 'AbortError') return true;
   const msg = err instanceof Error ? err.message : JSON.stringify(err);
-  return msg.includes('AbortError') || msg.includes('Lock broken');
+  return msg.includes('AbortError') || msg.includes('Lock broken') || msg.includes('steal');
 }
 
-export function useChat(isAuthenticated: boolean) {
+// ✅ PERUBAHAN UTAMA: terima userId dari luar, tidak pernah panggil getUser() sendiri
+// Ini menghilangkan lock conflict dengan useAuth yang juga pakai Supabase auth
+export function useChat(isAuthenticated: boolean, userId: string | null) {
   const [chats, setChats] = useState<Chat[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoadingChats, setIsLoadingChats] = useState(false);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const [activeChat, setActiveChat] = useState<string | null>(null);
 
+  // Cache pesan per chatId — hindari fetch ulang yang tidak perlu
+  const messagesCacheRef = useRef<Record<string, Message[]>>({});
   const activeChatRef = useRef<string | null>(null);
   const isFetchingChats = useRef(false);
+  const isFetchingMessages = useRef(false);
   const visibilityDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const supabaseRef = useRef(createClient());
   const supabase = supabaseRef.current;
@@ -35,12 +39,20 @@ export function useChat(isAuthenticated: boolean) {
   }, [activeChat]);
 
   useEffect(() => {
-    if (activeChat) {
-      localStorage.setItem(LAST_CHAT_KEY, activeChat);
-    }
+    if (activeChat) localStorage.setItem(LAST_CHAT_KEY, activeChat);
   }, [activeChat]);
 
-  const loadMessages = useCallback(async (chatId: string) => {
+  const loadMessages = useCallback(async (chatId: string, forceRefresh = false) => {
+    // ✅ Gunakan cache jika ada dan tidak dipaksa refresh
+    if (!forceRefresh && messagesCacheRef.current[chatId]) {
+      setMessages(messagesCacheRef.current[chatId]);
+      return;
+    }
+
+    // ✅ Guard concurrent fetch
+    if (isFetchingMessages.current) return;
+    isFetchingMessages.current = true;
+
     setIsLoadingMessages(true);
     setMessages([]);
     try {
@@ -52,48 +64,44 @@ export function useChat(isAuthenticated: boolean) {
 
       if (error) throw error;
 
-      setMessages(
-        (data || []).map((m) => ({
-          id: m.id,
-          role: m.role,
-          content: m.content,
-          sources: m.sources || [],
-        }))
-      );
+      const mapped = (data || []).map((m) => ({
+        id: m.id,
+        role: m.role,
+        content: m.content,
+        sources: m.sources || [],
+      }));
+
+      // Simpan ke cache
+      messagesCacheRef.current[chatId] = mapped;
+      setMessages(mapped);
     } catch (err: unknown) {
-      if (isAbortError(err)) {
-        console.warn('loadMessages: AbortError diabaikan');
-        return;
-      }
+      if (isAbortError(err)) { console.warn('loadMessages: AbortError diabaikan'); return; }
       console.error('Error loading messages:', err instanceof Error ? err.message : err);
     } finally {
       setIsLoadingMessages(false);
+      isFetchingMessages.current = false;
     }
   }, [supabase]);
 
   const loadChats = useCallback(async (isTabRestore = false) => {
+    // ✅ Tidak perlu auth check — userId sudah divalidasi oleh useAuth
+    if (!userId) return;
     if (isFetchingChats.current) return;
     isFetchingChats.current = true;
     setIsLoadingChats(true);
 
     try {
-      const { data: { user }, error: userError } = await supabase.auth.getUser();
-      if (userError || !user) {
-        console.warn('Auth error saat loadChats:', userError?.message);
-        return;
-      }
-
-      // ✅ FIX Bug 4: Gunakan module-level variable (in-memory, tidak hilang saat tab suspend)
-      // isNewLogin = true hanya pertama kali user ini login di tab ini
-      const isNewLogin = hasInitializedForUser !== user.id;
+      const isNewLogin = hasInitializedForUser !== userId;
       if (isNewLogin && !isTabRestore) {
-        hasInitializedForUser = user.id;
+        hasInitializedForUser = userId;
+        // Reset cache saat login baru
+        messagesCacheRef.current = {};
       }
 
       const { data, error } = await supabase
         .from('chats')
         .select('*')
-        .eq('user_id', user.id)
+        .eq('user_id', userId)
         .order('updated_at', { ascending: false });
 
       if (error) throw error;
@@ -108,60 +116,48 @@ export function useChat(isAuthenticated: boolean) {
 
       if (mapped.length > 0) {
         setActiveChat((prev) => {
-          // isTabRestore: selalu pertahankan chat yang aktif
           if (isTabRestore) {
             const savedId = localStorage.getItem(LAST_CHAT_KEY);
             const targetId = prev || savedId;
             const exists = mapped.find((c) => c.id === targetId);
             return exists ? targetId : mapped[0].id;
           }
-
-          // Login baru → jangan auto-select, tampilkan welcome screen
-          if (isNewLogin) {
-            return null;
-          }
-
-          // Reload biasa → pertahankan chat sebelumnya
+          if (isNewLogin) return null;
           const savedId = localStorage.getItem(LAST_CHAT_KEY);
           const targetId = prev || savedId;
           const exists = mapped.find((c) => c.id === targetId);
           return exists ? targetId : (prev || null);
         });
       } else {
-        // Tidak ada chat → buat otomatis hanya saat bukan login baru
         if (!isNewLogin || isTabRestore) {
           const { data: newChat } = await supabase
             .from('chats')
-            .insert({ user_id: user.id, title: 'Chat Baru' })
+            .insert({ user_id: userId, title: 'Chat Baru' })
             .select()
             .single();
           if (newChat) {
-            const nc = { id: newChat.id, title: newChat.title, starred: newChat.starred };
-            setChats([nc]);
+            setChats([{ id: newChat.id, title: newChat.title, starred: newChat.starred }]);
             setActiveChat(newChat.id);
           }
         }
       }
     } catch (err: unknown) {
-      if (isAbortError(err)) {
-        console.warn('loadChats: AbortError diabaikan');
-        return;
-      }
+      if (isAbortError(err)) { console.warn('loadChats: AbortError diabaikan'); return; }
       console.error('Error loading chats:', err instanceof Error ? err.message : err);
     } finally {
       setIsLoadingChats(false);
       isFetchingChats.current = false;
     }
-  }, [supabase]);
+  }, [supabase, userId]);
 
   useEffect(() => {
-    if (!isAuthenticated) {
+    if (!isAuthenticated || !userId) {
       setChats([]);
       setActiveChat(null);
       setMessages([]);
       setIsLoadingChats(false);
+      messagesCacheRef.current = {};
       localStorage.removeItem(LAST_CHAT_KEY);
-      // ✅ Reset in-memory flag saat logout agar login berikutnya terdeteksi sebagai baru
       hasInitializedForUser = null;
       return;
     }
@@ -170,33 +166,23 @@ export function useChat(isAuthenticated: boolean) {
 
     const handleVisibility = () => {
       if (document.visibilityState !== 'visible') return;
-
-      if (visibilityDebounceRef.current) {
-        clearTimeout(visibilityDebounceRef.current);
-      }
+      if (visibilityDebounceRef.current) clearTimeout(visibilityDebounceRef.current);
 
       visibilityDebounceRef.current = setTimeout(async () => {
-        await new Promise((resolve) => setTimeout(resolve, 300));
-
-        const { data: { user }, error: userError } = await supabase.auth.getUser();
-        if (userError || !user) {
-          console.warn('Session tidak valid saat visibility change, skip reload.');
-          return;
-        }
+        // ✅ Tidak perlu getUser() — userId sudah ada dari props
+        if (!userId) return;
 
         let currentChatId = activeChatRef.current;
         if (!currentChatId) {
           const savedId = localStorage.getItem(LAST_CHAT_KEY);
-          if (savedId) {
-            currentChatId = savedId;
-            setActiveChat(savedId);
-          }
+          if (savedId) { currentChatId = savedId; setActiveChat(savedId); }
         }
 
-        // isTabRestore = true → pertahankan chat aktif, jangan reset ke welcome screen
         await loadChats(true);
+
         if (currentChatId) {
-          await loadMessages(currentChatId);
+          // forceRefresh=true saat visibility change agar data terbaru
+          await loadMessages(currentChatId, true);
         }
       }, 500);
     };
@@ -204,11 +190,9 @@ export function useChat(isAuthenticated: boolean) {
     document.addEventListener('visibilitychange', handleVisibility);
     return () => {
       document.removeEventListener('visibilitychange', handleVisibility);
-      if (visibilityDebounceRef.current) {
-        clearTimeout(visibilityDebounceRef.current);
-      }
+      if (visibilityDebounceRef.current) clearTimeout(visibilityDebounceRef.current);
     };
-  }, [isAuthenticated, loadChats, loadMessages, supabase]);
+  }, [isAuthenticated, userId, loadChats, loadMessages]);
 
   useEffect(() => {
     if (activeChat) {
@@ -219,12 +203,11 @@ export function useChat(isAuthenticated: boolean) {
   }, [activeChat, loadMessages]);
 
   const createNewChat = async () => {
+    if (!userId) return; // ✅ pakai userId dari parameter
     try {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) return;
       const { data, error } = await supabase
         .from('chats')
-        .insert({ user_id: user.id, title: 'Chat Baru' })
+        .insert({ user_id: userId, title: 'Chat Baru' })
         .select()
         .single();
       if (error) throw error;
@@ -239,7 +222,8 @@ export function useChat(isAuthenticated: boolean) {
 
   const selectChat = (id: string) => {
     if (id === activeChat) {
-      loadMessages(id);
+      // Force refresh saat klik chat yang sama
+      loadMessages(id, true);
       return;
     }
     setActiveChat(id);
@@ -249,17 +233,16 @@ export function useChat(isAuthenticated: boolean) {
     try {
       const { error } = await supabase.from('chats').delete().eq('id', id);
       if (error) throw error;
+      // Hapus dari cache
+      delete messagesCacheRef.current[id];
       const remaining = chats.filter((c) => c.id !== id);
       setChats(remaining);
       if (activeChat === id) {
         setMessages([]);
         const nextId = remaining[0]?.id || null;
         setActiveChat(nextId);
-        if (nextId) {
-          localStorage.setItem(LAST_CHAT_KEY, nextId);
-        } else {
-          localStorage.removeItem(LAST_CHAT_KEY);
-        }
+        if (nextId) localStorage.setItem(LAST_CHAT_KEY, nextId);
+        else localStorage.removeItem(LAST_CHAT_KEY);
       }
     } catch (err) {
       console.error('Error deleting chat:', err);
@@ -284,10 +267,13 @@ export function useChat(isAuthenticated: boolean) {
     if (!activeChat) return;
     const currentChatId = activeChat;
 
-    const tempUserId = Date.now().toString();
-    setMessages((prev) => [...prev, { id: tempUserId, role: 'user', content }]);
+    const tempId = Date.now().toString();
     const loadingId = (Date.now() + 1).toString();
-    setMessages((prev) => [...prev, { id: loadingId, role: 'assistant', content: '', isLoading: true }]);
+
+    const userMsg: Message = { id: tempId, role: 'user', content };
+    const loadingMsg: Message = { id: loadingId, role: 'assistant', content: '', isLoading: true };
+
+    setMessages((prev) => [...prev, userMsg, loadingMsg]);
 
     const isFirstMessage = messages.filter((m) => m.role === 'user').length === 0;
     if (isFirstMessage) {
@@ -316,24 +302,27 @@ export function useChat(isAuthenticated: boolean) {
         .single();
 
       if (activeChatRef.current === currentChatId) {
-        setMessages((prev) =>
-          prev.map((msg) => msg.id === loadingId ? {
-            id: savedMsg?.id || loadingId,
-            role: 'assistant',
-            content: data.answer,
-            sources: data.sources || [],
-          } : msg)
-        );
+        const assistantMsg: Message = {
+          id: savedMsg?.id || loadingId,
+          role: 'assistant',
+          content: data.answer,
+          sources: data.sources || [],
+        };
+        setMessages((prev) => prev.map((msg) => msg.id === loadingId ? assistantMsg : msg));
+        // Update cache
+        messagesCacheRef.current[currentChatId] = [
+          ...(messagesCacheRef.current[currentChatId] || []).filter(m => m.id !== loadingId),
+          { id: tempId, role: 'user', content },
+          assistantMsg,
+        ];
       }
     } catch {
       if (activeChatRef.current === currentChatId) {
-        setMessages((prev) =>
-          prev.map((msg) => msg.id === loadingId ? {
-            id: loadingId,
-            role: 'assistant',
-            content: '❌ Maaf, terjadi kesalahan saat menghubungi server.',
-          } : msg)
-        );
+        setMessages((prev) => prev.map((msg) => msg.id === loadingId ? {
+          id: loadingId,
+          role: 'assistant',
+          content: '❌ Maaf, terjadi kesalahan saat menghubungi server.',
+        } : msg));
       }
     }
   };

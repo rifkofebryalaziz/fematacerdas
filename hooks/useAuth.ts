@@ -8,20 +8,20 @@ import { User } from '@/types';
 function isAbortError(err: unknown): boolean {
   if (err instanceof Error && err.name === 'AbortError') return true;
   const msg = err instanceof Error ? err.message : JSON.stringify(err);
-  return msg.includes('AbortError') || msg.includes('Lock broken');
+  return msg.includes('AbortError') || msg.includes('Lock broken') || msg.includes('steal');
 }
 
 export function useAuth() {
   const [user, setUser] = useState<User | null>(null);
+  const [userId, setUserId] = useState<string | null>(null); // ✅ expose userId
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
 
   const supabaseRef = useRef(createClient());
   const supabase = supabaseRef.current;
   const isLoadingProfileRef = useRef(false);
-
-  // ✅ FIX Bug 2: Simpan isAuthenticated di ref agar closure selalu baca nilai terbaru
   const isAuthenticatedRef = useRef(false);
+
   useEffect(() => {
     isAuthenticatedRef.current = isAuthenticated;
   }, [isAuthenticated]);
@@ -30,6 +30,7 @@ export function useAuth() {
 
   const clearSession = useCallback(() => {
     setUser(null);
+    setUserId(null);
     setIsAuthenticated(false);
     isAuthenticatedRef.current = false;
     Object.keys(localStorage).forEach((key) => {
@@ -38,9 +39,9 @@ export function useAuth() {
     localStorage.removeItem('last_active_chat');
   }, []);
 
-  const loadProfile = useCallback(async (userId: string) => {
+  const loadProfile = useCallback(async (authUserId: string) => {
     if (isLoadingProfileRef.current) {
-      console.warn('loadProfile: sudah berjalan, skip duplikat call');
+      console.warn('loadProfile: sudah berjalan, skip');
       return;
     }
     isLoadingProfileRef.current = true;
@@ -49,14 +50,11 @@ export function useAuth() {
       const { data: profile, error } = await supabase
         .from('profiles')
         .select('*')
-        .eq('id', userId)
+        .eq('id', authUserId)
         .maybeSingle();
 
       if (error) {
-        if (isAbortError(error)) {
-          console.warn('loadProfile: AbortError diabaikan');
-          return;
-        }
+        if (isAbortError(error)) { console.warn('loadProfile: AbortError diabaikan'); return; }
         console.error('Load profile error:', error.message);
         return;
       }
@@ -71,18 +69,15 @@ export function useAuth() {
           avatar: profile.avatar,
           role: profile.role,
         });
+        setUserId(authUserId); // ✅ set userId bersamaan dengan user profile
         setIsAuthenticated(true);
         isAuthenticatedRef.current = true;
       }
     } catch (err: unknown) {
-      if (isAbortError(err)) {
-        console.warn('loadProfile: AbortError diabaikan');
-        return;
-      }
+      if (isAbortError(err)) { console.warn('loadProfile: AbortError diabaikan'); return; }
       console.error('loadProfile exception:', err instanceof Error ? err.message : err);
     } finally {
       isLoadingProfileRef.current = false;
-      // ✅ FIX Bug 1: Pastikan isLoading selalu di-set false setelah loadProfile selesai
       setIsLoading(false);
     }
   }, [supabase]);
@@ -91,17 +86,14 @@ export function useAuth() {
     const initSession = async () => {
       try {
         const { data: { session }, error } = await supabase.auth.getSession();
-
         if (error) {
           console.warn('Session error:', error.message);
           clearSession();
           setIsLoading(false);
           return;
         }
-
         if (session?.user) {
           await loadProfile(session.user.id);
-          // loadProfile sudah set setIsLoading(false) di finally-nya
         } else {
           setIsLoading(false);
         }
@@ -121,23 +113,15 @@ export function useAuth() {
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       async (event, session) => {
         if (event === 'TOKEN_REFRESHED' && !session) {
-          console.warn('Token refresh failed — logging out');
-          clearSession();
-          setIsLoading(false);
-          return;
+          clearSession(); setIsLoading(false); return;
         }
-
         if (event === 'SIGNED_OUT') {
-          clearSession();
-          setIsLoading(false);
-          return;
+          clearSession(); setIsLoading(false); return;
         }
-
         if (session?.user) {
           await loadProfile(session.user.id);
         } else {
-          clearSession();
-          setIsLoading(false);
+          clearSession(); setIsLoading(false);
         }
       }
     );
@@ -147,30 +131,17 @@ export function useAuth() {
       try {
         const { data: { session }, error } = await supabase.auth.getSession();
         if (error) {
-          if (isAbortError(error)) {
-            console.warn('handleVisibility: AbortError diabaikan');
-            return;
-          }
-          console.warn('Session check failed:', error.message);
-          clearSession();
-          return;
+          if (isAbortError(error)) { console.warn('handleVisibility: AbortError diabaikan'); return; }
+          clearSession(); return;
         }
-        // ✅ FIX Bug 2: Gunakan ref, bukan closure variable
-        if (!session && isAuthenticatedRef.current) {
-          clearSession();
-        }
+        if (!session && isAuthenticatedRef.current) clearSession();
       } catch (err) {
-        if (isAbortError(err)) {
-          console.warn('handleVisibility: AbortError diabaikan');
-          return;
-        }
-        console.warn('Visibility session check failed:', err);
+        if (isAbortError(err)) { console.warn('handleVisibility: AbortError diabaikan'); return; }
         clearSession();
       }
     };
 
     document.addEventListener('visibilitychange', handleVisibility);
-
     return () => {
       subscription.unsubscribe();
       document.removeEventListener('visibilitychange', handleVisibility);
@@ -183,21 +154,14 @@ export function useAuth() {
   };
 
   const register = async (name: string, email: string, password: string) => {
-    const { error } = await supabase.auth.signUp({
-      email,
-      password,
-      options: { data: { name } },
-    });
+    const { error } = await supabase.auth.signUp({ email, password, options: { data: { name } } });
     if (error) throw new Error(error.message);
   };
 
   const loginWithGoogle = async () => {
     const { error } = await supabase.auth.signInWithOAuth({
       provider: 'google',
-      options: {
-        redirectTo: `${window.location.origin}/auth/callback`,
-        queryParams: { prompt: 'select_account' },
-      },
+      options: { redirectTo: `${window.location.origin}/auth/callback`, queryParams: { prompt: 'select_account' } },
     });
     if (error) throw new Error(error.message);
   };
@@ -209,24 +173,19 @@ export function useAuth() {
     if (error) throw new Error(error.message);
   };
 
-  // ✅ FIX Bug 3: logout sekarang clear state + redirect
   const logout = async () => {
     try {
       await supabase.auth.signOut();
     } catch (err) {
       console.warn('signOut error:', err);
     } finally {
-      // Pastikan state bersih meski signOut gagal
       clearSession();
-      sessionStorage.removeItem('chat_session_id');
-      router.push('/login');
+      router.push('/');
     }
   };
 
   const updateProfile = async (updates: Partial<User>) => {
-    const { data: { session } } = await supabase.auth.getSession();
-    if (!session?.user) return;
-
+    if (!userId) return;
     const { error } = await supabase
       .from('profiles')
       .update({
@@ -236,14 +195,14 @@ export function useAuth() {
         consultation_purpose: updates.consultationPurpose,
         avatar: updates.avatar,
       })
-      .eq('id', session.user.id);
-
+      .eq('id', userId);
     if (error) throw new Error(error.message);
     setUser((prev) => (prev ? { ...prev, ...updates } : null));
   };
 
   return {
     user,
+    userId,        // ✅ dipakai oleh ChatContext
     isAuthenticated,
     isLoading,
     login,
@@ -251,6 +210,6 @@ export function useAuth() {
     loginWithGoogle,
     forgotPassword,
     logout,
-    updateProfile,
+        updateProfile,
   };
 }

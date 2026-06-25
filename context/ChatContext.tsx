@@ -9,9 +9,10 @@ type ChatContextType = ReturnType<typeof useChat>;
 const ChatContext = createContext<ChatContextType | undefined>(undefined);
 
 export function ChatProvider({ children }: { children: React.ReactNode }) {
-  // ✅ Ambil isAuthenticated dari AuthContext
-  const { isAuthenticated } = useAuthContext();
-  const chat = useChat(isAuthenticated);
+  const { isAuthenticated, userId } = useAuthContext();
+  // ✅ Kirim userId langsung — useChat tidak perlu panggil getUser() sendiri
+  // Ini menghilangkan Supabase auth lock conflict antara useAuth dan useChat
+  const chat = useChat(isAuthenticated, userId);
   return <ChatContext.Provider value={chat}>{children}</ChatContext.Provider>;
 }
 
